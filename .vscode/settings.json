@@ -1,0 +1,7 @@
+{
+  "python.analysis.typeCheckingMode": "basic",
+  "editor.formatOnSave": true,
+  "python.formatting.provider": "black",
+  "files.autoSave": "onFocusChange",
+  "python.terminal.activateEnvironment": true
+}
