@@ -1,0 +1,25 @@
+execution:
+  # Execution behavior (applies to paper; also useful for live assumptions)
+  default_order_type: MARKET
+  time_in_force: DAY
+
+paper:
+  # Fill model knobs
+  fill_on: "next_poll" # "immediate" | "next_poll"
+  use_spread_for_market: true # BUY at ask, SELL at bid (more realistic than mid)
+  extra_slippage_bps: 2.0 # additional slippage on top of spread
+  allow_partial_fills: true
+  partial_fill_ratio: 0.6 # if partial fills enabled, first fill ratio (0-1)
+  limit_fill_rule: "touch" # "touch" (last crosses) | "bar_high_low" (if you provide high/low)
+  max_fill_delay_polls: 0 # e.g. 1 means delay fill until after 1 poll cycle
+
+costs:
+  commission:
+    model: "fixed_per_order" # "none" | "fixed_per_order" | "per_share"
+    fixed_per_order: 0.00
+    per_share: 0.000 # used if model="per_share"
+    min_commission: 0.00
+
+  slippage:
+    model: "bps" # "none" | "bps"
+    bps: 0.0 # base slippage in bps (can be 0; extra_slippage_bps still applies in paper)

@@ -1,0 +1,32 @@
+# Pytest temp dir (--basetemp=tmp/pytest)
+tmp/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+*.egg
+dist/
+build/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Node (if ui uses npm)
+node_modules/
+
+# Data / secrets (uncomment if you store local data here)
+# data/
+# .env
+# *.key

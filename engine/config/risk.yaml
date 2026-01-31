@@ -1,0 +1,6 @@
+risk:
+  max_notional_per_trade: 10000
+  max_position_notional: 30000
+  min_cash_buffer: 1000
+  max_open_orders: 20
+  allow_short: false

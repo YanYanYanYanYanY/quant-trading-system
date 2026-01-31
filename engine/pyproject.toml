@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quant-trading-engine"
+version = "0.1.0"
+description = "Quantitative trading engine module"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "pandas>=2.0.0",
+    "numpy>=1.24.0",
+    "pyyaml>=6.0",
+    "scikit-learn>=1.3.0",
+    "joblib>=1.3.0",
+    "requests>=2.31.0",
+]
+
+[project.optional-dependencies]
+alpaca = [
+    "alpaca-trade-api>=3.0.0",
+]
+
+[tool.setuptools]
+# Packages are the subdirectories of engine/
+packages = [
+    "backtest",
+    "config", 
+    "data",
+    "execution",
+    "features",
+    "models",
+    "strategy",
+]
+
+[tool.setuptools.package-data]
+"config" = ["*.yaml", "*.yml"]
