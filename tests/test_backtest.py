@@ -12,13 +12,15 @@ class SimpleTestStrategy(Strategy):
     """Simple test strategy for backtesting."""
     
     def __init__(self):
-        super().__init__(name="test_strategy")
+        super().__init__(warmup_bars=0)
     
-    def warmup_bars(self) -> int:
-        return 0
+    def warmup_bar(self, bar) -> None:
+        pass
     
-    def on_bar(self, i: int, row: pd.Series, data: pd.DataFrame, state: StrategyState, context: dict):
+    def on_bar(self, bar):
         """Buy on first bar, sell on 5th bar."""
+        i = bar["_i"]
+        state = bar["_state"]
         if i == 0 and state.position == 0:
             return Order(side=Side.BUY, qty=1, reason="entry")
         elif i == 4 and state.position > 0:

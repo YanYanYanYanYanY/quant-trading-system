@@ -14,7 +14,7 @@ type EngineState = {
     mode: EngineMode;
     runState: RunState;
     canTrade: boolean;
-    warmupProgress: number; // 0..1
+    warmupProgress: number;
     killSwitchArmed: boolean;
     setEngine: (p: Partial<EngineState>) => void;
 };
@@ -31,13 +31,13 @@ type PositionsState = {
 
 type OrdersState = {
     byId: Record<string, Order>;
-    ids: string[]; // newest first
+    ids: string[];
     upsertOrders: (items: Order[]) => void;
 };
 
 type FillsState = {
-    byId: Record<string, Fill>;
-    byOrderId: Record<string, string[]>;
+    fillsById: Record<string, Fill>;
+    fillsByOrderId: Record<string, string[]>;
     upsertFills: (items: Fill[]) => void;
 };
 
@@ -100,23 +100,25 @@ export const useAppStore = create<AppStore>((set, get) => ({
             return { byId, ids: ids.slice(0, 5000) };
         }),
 
-    // fills
-    byId: {},
-    byOrderId: {},
+    // fills (namespaced to avoid collision with orders byId)
+    fillsById: {},
+    fillsByOrderId: {},
     upsertFills: (items) =>
         set((st) => {
-            const byId = { ...st.byId };
-            const byOrderId = { ...st.byOrderId };
+            const fillsById = { ...st.fillsById };
+            const fillsByOrderId = { ...st.fillsByOrderId };
             for (const f of items) {
-                const isNew = !byId[f.id];
-                byId[f.id] = f;
+                const isNew = !fillsById[f.id];
+                fillsById[f.id] = f;
                 if (isNew) {
-                    const arr = byOrderId[f.orderId] ? [...byOrderId[f.orderId]] : [];
+                    const arr = fillsByOrderId[f.orderId]
+                        ? [...fillsByOrderId[f.orderId]]
+                        : [];
                     arr.unshift(f.id);
-                    byOrderId[f.orderId] = arr.slice(0, 200);
+                    fillsByOrderId[f.orderId] = arr.slice(0, 200);
                 }
             }
-            return { byId, byOrderId };
+            return { fillsById, fillsByOrderId };
         }),
 
     // risk
@@ -152,7 +154,6 @@ export const useAppStore = create<AppStore>((set, get) => ({
                 s.setRisk(evt.payload);
                 break;
             default:
-                // ignore unknown events for now
                 break;
         }
     },

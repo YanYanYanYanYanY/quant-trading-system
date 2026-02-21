@@ -7,20 +7,16 @@ import { StrategiesPage } from "../pages/StrategiesPage";
 import { RiskPage } from "../pages/RiskPage";
 import { LogsPage } from "../pages/LogsPage";
 import { useTradingWS } from "./ws";
-import { MockEventFeeder } from "./mockEvents";
-
+import { useApiSync } from "./useApiSync";
+import { getWsUrl } from "./api";
 
 export default function App() {
-  // change to your FastAPI websocket endpoint
-  useTradingWS("ws://localhost:8000/ws");
+  useApiSync();
+  useTradingWS(getWsUrl());
 
   return (
-
     <BrowserRouter>
       <AppShell>
-        <>
-          <MockEventFeeder />
-        </>
         <Routes>
           <Route path="/" element={<DashboardPage />} />
           <Route path="/strategies" element={<StrategiesPage />} />

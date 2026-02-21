@@ -1,92 +1,134 @@
+"""
+Boundary object between the FastAPI layer and the engine module.
+
+Wired to real engine components:
+  - **Data**: ``engine.data.storage`` for OHLCV candles, ``DataEngine`` for
+    universe resolution.
+  - **Strategies**: ``RegimeAlphaStrategy`` and the regime-alpha pipeline.
+  - **Backtests**: ``run_regime_backtest`` for portfolio-level backtests.
+  - **Trading**: ``AlpacaBroker`` → ``ExecutionEngine`` for paper/live
+    order submission, fill polling, account snapshots, and positions.
+"""
+
 from __future__ import annotations
 
+import logging
+import os
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
 import pandas as pd
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from app.schemas.requests import BacktestRequest, PlaceOrderRequest
-from engine.backtest.backtest import run_backtest, BacktestResult
 from engine.data.storage import RAW_DIR, load_csv, load_parquet, file_exists
 from engine.data.update_daily_aggregates import get_tickers
-from engine.strategy.mean_revert import MeanReversionStrategy
-from engine.strategy.rules import MeanRevertParams
+from engine.execution.broker_alpaca import AlpacaBroker, AlpacaBrokerConfig
+from engine.execution.execution_engine import ExecutionEngine
+from engine.execution.order_types import (
+    Fill,
+    Order,
+    OrderStatus,
+    OrderType,
+    Side,
+)
+from engine.execution.risk import RiskLimits, RiskManager
 
+log = logging.getLogger(__name__)
 
-# Strategy registry: maps strategy names to factory functions
-STRATEGY_REGISTRY: Dict[str, Callable] = {
-    "mean_revert_v1": lambda: MeanReversionStrategy(MeanRevertParams(), name="mean_revert_v1"),
-}
+# ---------------------------------------------------------------------------
+# Strategy registry (names surfaced to the UI)
+# ---------------------------------------------------------------------------
+
+STRATEGY_NAMES: List[str] = [
+    "regime_alpha_v1",
+]
 
 
 class EngineClient:
-    """
-    Boundary object between API and engine.
-    
+    """Boundary object between API and engine.
+
     Wired to the engine module for:
-      - Data: loads OHLCV from engine.data.storage (parquet/csv)
+      - Data: loads OHLCV from ``engine.data.storage`` (parquet/csv)
       - Symbols: reads from ticker file or scans data directory
-      - Strategies: uses STRATEGY_REGISTRY
-      - Backtests: runs real backtests via engine.backtest.run_backtest
-      
-    Trading methods (place_order, start_trading, etc.) still use in-memory stubs.
-    Wire to engine.execution when ready for paper/live trading.
+      - Strategies: exposes strategy names from the registry
+      - Backtests: runs portfolio-level backtests via ``run_regime_backtest``
+      - Trading: real paper/live trading via ``AlpacaBroker`` → ``ExecutionEngine``
+
+    The broker is lazily initialised on ``start_trading()`` so that the
+    API can boot even when Alpaca keys are not yet configured.
     """
 
     def __init__(self) -> None:
-        self._mode = "stopped"  # stopped/paper/live
+        self._mode: str = "stopped"
         self._backtests: Dict[str, Dict[str, Any]] = {}
-        self._orders: List[Dict[str, Any]] = []
-        self._positions: Dict[str, Dict[str, Any]] = {}
 
-        self._symbols = ["AAPL", "MSFT", "NVDA", "SPY"]
-        self._strategies = ["mean_revert_v1", "trend_v1"]
+        # Broker / execution (created on start_trading)
+        self._broker: Optional[AlpacaBroker] = None
+        self._engine: Optional[ExecutionEngine] = None
+        self._risk: Optional[RiskManager] = None
+        self._fill_poller: Optional[threading.Thread] = None
+        self._poll_stop = threading.Event()
 
         self._event_sink: Optional[Callable[[Dict[str, Any]], None]] = None
 
-    # -----------------
+    # ------------------------------------------------------------------
     # Helpers
-    # -----------------
-    def utcnow_iso(self) -> str:
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def utcnow_iso() -> str:
         return datetime.now(timezone.utc).isoformat()
 
-    # -----------------
-    # Status
-    # -----------------
-    def get_status(self) -> Dict[str, Any]:
-        # ws_clients + last_event_ts are owned by WSManager; API merges them
-        return {"mode": self._mode, "engine_ok": True}
+    def _ensure_broker(self) -> AlpacaBroker:
+        """Return the active broker, or raise if not trading."""
+        if self._broker is None:
+            raise RuntimeError(
+                "Broker not initialised. Call start_trading first."
+            )
+        return self._broker
 
-    # -----------------
-    # Data
-    # -----------------
+    # ------------------------------------------------------------------
+    # Status
+    # ------------------------------------------------------------------
+
+    def get_status(self) -> Dict[str, Any]:
+        broker_ok = self._broker is not None
+        return {
+            "mode": self._mode,
+            "engine_ok": True,
+            "broker_connected": broker_ok,
+        }
+
+    # ------------------------------------------------------------------
+    # Data (already wired to engine.data.storage)
+    # ------------------------------------------------------------------
+
     def list_symbols(self) -> List[str]:
         """Return available symbols from ticker file or data directory."""
-        # Try to read from ticker file
         ticker_file = RAW_DIR / "stocks" / "good_quality_stock_tickers_200.txt"
         if ticker_file.exists():
             try:
                 return get_tickers(ticker_file)
             except Exception:
                 pass
-        
-        # Fallback: scan data directory for existing files
+
         data_dir = RAW_DIR / "stocks"
         if data_dir.exists():
-            symbols = set()
+            symbols: set[str] = set()
             for f in data_dir.glob("*_1d.parquet"):
-                symbol = f.stem.replace("_1d", "")
-                symbols.add(symbol)
+                symbols.add(f.stem.replace("_1d", ""))
             for f in data_dir.glob("*_1d.csv"):
-                symbol = f.stem.replace("_1d", "")
-                symbols.add(symbol)
+                symbols.add(f.stem.replace("_1d", ""))
             if symbols:
                 return sorted(symbols)
-        
-        # Final fallback to hardcoded list
-        return list(self._symbols)
+
+        return ["AAPL", "MSFT", "NVDA", "SPY"]
 
     def get_candles(
         self,
@@ -98,47 +140,39 @@ class EngineClient:
     ) -> List[Dict[str, Any]]:
         """Load candles from engine storage (parquet/csv)."""
         symbol = symbol.upper()
-        
-        # Determine file path based on timeframe
-        if tf == "1d" or tf == "day":
-            rel_path_parquet = f"raw/stocks/{symbol}_1d.parquet"
-            rel_path_csv = f"raw/stocks/{symbol}_1d.csv"
+
+        if tf in ("1d", "day"):
+            rel_pq = f"raw/stocks/{symbol}_1d.parquet"
+            rel_csv = f"raw/stocks/{symbol}_1d.csv"
         else:
-            rel_path_parquet = f"raw/stocks/{symbol}_{tf}.parquet"
-            rel_path_csv = f"raw/stocks/{symbol}_{tf}.csv"
-        
-        # Try to load data (parquet first, then CSV)
-        df = None
+            rel_pq = f"raw/stocks/{symbol}_{tf}.parquet"
+            rel_csv = f"raw/stocks/{symbol}_{tf}.csv"
+
+        df: Optional[pd.DataFrame] = None
         try:
-            if file_exists(rel_path_parquet):
-                df = load_parquet(rel_path_parquet)
-            elif file_exists(rel_path_csv):
-                df = load_csv(rel_path_csv)
-        except Exception as e:
-            print(f"Error loading candles for {symbol}: {e}")
+            if file_exists(rel_pq):
+                df = load_parquet(rel_pq)
+            elif file_exists(rel_csv):
+                df = load_csv(rel_csv)
+        except Exception as exc:
+            log.warning("Error loading candles for %s: %s", symbol, exc)
             return []
-        
+
         if df is None or df.empty:
             return []
-        
-        # Ensure timestamp column is datetime
+
         if "timestamp" in df.columns:
             df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
             df = df.sort_values("timestamp")
-        
-        # Filter by date range
+
         if start and "timestamp" in df.columns:
-            start_dt = pd.to_datetime(start, utc=True)
-            df = df[df["timestamp"] >= start_dt]
+            df = df[df["timestamp"] >= pd.to_datetime(start, utc=True)]
         if end and "timestamp" in df.columns:
-            end_dt = pd.to_datetime(end, utc=True)
-            df = df[df["timestamp"] <= end_dt]
-        
-        # Apply limit (take last N rows)
+            df = df[df["timestamp"] <= pd.to_datetime(end, utc=True)]
+
         if limit and len(df) > limit:
             df = df.tail(limit)
-        
-        # Convert to list of dicts with standard column names
+
         candles: List[Dict[str, Any]] = []
         for _, row in df.iterrows():
             ts = row.get("timestamp")
@@ -150,19 +184,19 @@ class EngineClient:
                 "close": float(row.get("close", row.get("c", 0))),
                 "volume": float(row.get("volume", row.get("v", 0))),
             })
-        
         return candles
 
-    # -----------------
+    # ------------------------------------------------------------------
     # Strategies
-    # -----------------
-    def list_strategies(self) -> List[str]:
-        """Return available strategies from the registry."""
-        return list(STRATEGY_REGISTRY.keys())
+    # ------------------------------------------------------------------
 
-    # -----------------
+    def list_strategies(self) -> List[str]:
+        return list(STRATEGY_NAMES)
+
+    # ------------------------------------------------------------------
     # Backtests
-    # -----------------
+    # ------------------------------------------------------------------
+
     def start_backtest(self, req: BacktestRequest) -> str:
         job_id = uuid.uuid4().hex
         self._backtests[job_id] = {
@@ -193,168 +227,372 @@ class EngineClient:
             "error": bt["error"],
         }
 
-    def simulate_backtest_run(self, job_id: str, emit: Callable[[Dict[str, Any]], None]) -> None:
-        """
-        Run a real backtest using the engine module.
-        Loads data, creates strategy, runs backtest, and emits events.
-        """
+    def simulate_backtest_run(
+        self, job_id: str, emit: Callable[[Dict[str, Any]], None]
+    ) -> None:
+        """Run a portfolio backtest using the regime-alpha pipeline."""
         bt = self._backtests.get(job_id)
         if bt is None:
             return
 
         bt["state"] = "running"
-        emit({"type": "log", "ts": self.utcnow_iso(), "data": {"msg": f"backtest {job_id} started"}})
+        emit({
+            "type": "log",
+            "ts": self.utcnow_iso(),
+            "data": {"msg": f"backtest {job_id} started"},
+        })
 
         try:
+            from engine.backtest.runner import run_regime_backtest
+
             req = bt["req"]
             symbol = req["symbol"].upper()
-            initial_cash = req.get("initial_cash", 10_000.0)
-            strategy_name = req["strategy"]
-            
-            # 1. Load data
-            emit({"type": "log", "ts": self.utcnow_iso(), "data": {"msg": f"Loading data for {symbol}..."}})
-            
-            rel_path_parquet = f"raw/stocks/{symbol}_1d.parquet"
-            rel_path_csv = f"raw/stocks/{symbol}_1d.csv"
-            
-            df = None
-            if file_exists(rel_path_parquet):
-                df = load_parquet(rel_path_parquet)
-            elif file_exists(rel_path_csv):
-                df = load_csv(rel_path_csv)
-            
-            if df is None or df.empty:
-                raise ValueError(f"No data found for {symbol}")
-            
-            # 2. Prepare data
-            # Ensure 'close' column exists
-            if "close" not in df.columns:
-                if "c" in df.columns:
-                    df["close"] = df["c"]
-                else:
-                    raise ValueError("Data must have 'close' or 'c' column")
-            
-            # Add features needed by mean revert strategy (sma20, std20)
-            df["sma20"] = df["close"].rolling(20).mean()
-            df["std20"] = df["close"].rolling(20).std()
-            
-            # Drop rows with NaN (from rolling calculations)
-            df = df.dropna()
-            
-            if df.empty:
-                raise ValueError(f"Not enough data for {symbol} after feature calculation")
-            
-            # Set timestamp as index if available
-            if "timestamp" in df.columns:
-                df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-                df = df.set_index("timestamp")
-            
-            emit({"type": "log", "ts": self.utcnow_iso(), "data": {"msg": f"Loaded {len(df)} bars for {symbol}"}})
-            bt["progress"] = 0.1
-            
-            # 3. Get strategy from registry
-            if strategy_name not in STRATEGY_REGISTRY:
-                raise ValueError(f"Unknown strategy: {strategy_name}. Available: {list(STRATEGY_REGISTRY.keys())}")
-            
-            strategy = STRATEGY_REGISTRY[strategy_name]()
-            emit({"type": "log", "ts": self.utcnow_iso(), "data": {"msg": f"Using strategy: {strategy_name}"}})
+            initial_cash = req.get("initial_cash", 100_000.0)
+
+            emit({
+                "type": "log",
+                "ts": self.utcnow_iso(),
+                "data": {"msg": f"Running regime-alpha backtest for {symbol}..."},
+            })
             bt["progress"] = 0.2
-            
-            # 4. Run backtest
-            emit({"type": "log", "ts": self.utcnow_iso(), "data": {"msg": "Running backtest..."}})
-            
-            result = run_backtest(
-                data=df,
-                strategy=strategy,
+
+            result = run_regime_backtest(
+                universe=[symbol],
                 initial_cash=initial_cash,
-                slippage_bps=5.0,
+                auto_sync=False,
             )
-            
+
             bt["progress"] = 0.9
-            
-            # 5. Emit final results
+
+            stats = result.stats
             emit({
                 "type": "pnl_update",
                 "ts": self.utcnow_iso(),
                 "data": {
                     "job_id": job_id,
-                    "equity": result.stats["final_equity"],
+                    "equity": stats.get("final_equity", initial_cash),
                     "progress": 1.0,
                 },
             })
-            
-            # 6. Store result
+
             bt["state"] = "done"
             bt["progress"] = 1.0
             bt["result"] = {
                 "job_id": job_id,
-                "final_equity": result.stats["final_equity"],
-                "return_pct": result.stats["total_return"] * 100.0,
-                "max_drawdown": result.stats["max_drawdown"] * 100.0,
-                "num_trades": int(result.stats["num_trades"]),
-                "win_rate": result.stats["win_rate"] * 100.0,
-                "avg_trade_pnl": result.stats["avg_trade_pnl"],
+                "final_equity": stats.get("final_equity", initial_cash),
+                "return_pct": stats.get("total_return", 0) * 100.0,
+                "max_drawdown": stats.get("max_drawdown", 0) * 100.0,
+                "sharpe": stats.get("sharpe", 0),
+                "n_rebalances": stats.get("n_rebalances", 0),
+                "avg_positions": stats.get("avg_positions", 0),
             }
-            
-            emit({"type": "log", "ts": self.utcnow_iso(), "data": {
-                "msg": f"backtest {job_id} done: {result.stats['num_trades']:.0f} trades, "
-                       f"{result.stats['total_return']*100:.2f}% return"
-            }})
 
-        except Exception as e:
+            emit({
+                "type": "log",
+                "ts": self.utcnow_iso(),
+                "data": {
+                    "msg": (
+                        f"backtest {job_id} done: "
+                        f"{stats.get('total_return', 0)*100:.2f}% return, "
+                        f"sharpe={stats.get('sharpe', 0):.2f}"
+                    )
+                },
+            })
+
+        except Exception as exc:
             bt["state"] = "failed"
-            bt["error"] = str(e)
-            emit({"type": "log", "ts": self.utcnow_iso(), "data": {"msg": f"backtest {job_id} failed: {e}"}})
+            bt["error"] = str(exc)
+            emit({
+                "type": "log",
+                "ts": self.utcnow_iso(),
+                "data": {"msg": f"backtest {job_id} failed: {exc}"},
+            })
 
-    # -----------------
-    # Live/Paper trading
-    # -----------------
-    def start_trading(self, emit: Callable[[Dict[str, Any]], None]) -> None:
-        self._mode = "paper"
+    # ------------------------------------------------------------------
+    # Live / Paper trading — wired to AlpacaBroker + ExecutionEngine
+    # ------------------------------------------------------------------
+
+    def start_trading(
+        self, emit: Callable[[Dict[str, Any]], None]
+    ) -> None:
+        """Initialise broker, risk manager, and execution engine.
+
+        Reads Alpaca credentials from environment variables and starts
+        a background fill-polling thread.
+        """
+        api_key = os.getenv("ALPACA_API_KEY", "")
+        api_secret = os.getenv("ALPACA_API_SECRET", "")
+        paper = os.getenv("ALPACA_PAPER", "true").lower() in ("true", "1", "yes")
+
+        if not api_key or not api_secret:
+            raise RuntimeError(
+                "ALPACA_API_KEY and ALPACA_API_SECRET must be set in .env"
+            )
+
+        cfg = AlpacaBrokerConfig(paper=paper)
+        self._broker = AlpacaBroker(
+            api_key=api_key, api_secret=api_secret, cfg=cfg,
+        )
+        self._risk = RiskManager(RiskLimits())
+        self._engine = ExecutionEngine(
+            broker=self._broker, risk=self._risk,
+        )
         self._event_sink = emit
-        emit({"type": "log", "ts": self.utcnow_iso(), "data": {"msg": "paper trading started"}})
+        self._mode = "paper" if paper else "live"
+
+        # Start background fill poller
+        self._poll_stop.clear()
+        self._fill_poller = threading.Thread(
+            target=self._poll_fills_loop, daemon=True,
+        )
+        self._fill_poller.start()
+
+        log.info("Trading started (mode=%s)", self._mode)
+        emit({
+            "type": "log",
+            "ts": self.utcnow_iso(),
+            "data": {"msg": f"{self._mode} trading started — broker connected"},
+        })
 
     def stop_trading(self) -> None:
+        """Stop trading, cancel open orders, and shut down the fill poller."""
+        if self._broker is not None:
+            try:
+                self._broker.cancel_all_orders()
+            except Exception as exc:
+                log.warning("Error cancelling orders on stop: %s", exc)
+
+        self._poll_stop.set()
+        if self._fill_poller and self._fill_poller.is_alive():
+            self._fill_poller.join(timeout=5)
+
         self._mode = "stopped"
+        self._broker = None
+        self._engine = None
+        self._risk = None
         self._event_sink = None
+        log.info("Trading stopped")
+
+    def _poll_fills_loop(self) -> None:
+        """Background thread that polls broker for fills every 2 seconds."""
+        while not self._poll_stop.is_set():
+            try:
+                if self._engine is not None:
+                    fills = self._engine.poll()
+                    for fill in fills:
+                        self._emit_fill(fill)
+            except Exception as exc:
+                log.warning("Fill poll error: %s", exc)
+            self._poll_stop.wait(2.0)
+
+    def _emit_fill(self, fill: Fill) -> None:
+        """Push a fill event through the WebSocket event sink."""
+        if self._event_sink is None:
+            return
+        self._event_sink({
+            "type": "order_filled",
+            "ts": self.utcnow_iso(),
+            "data": {
+                "order_id": fill.order_id,
+                "symbol": fill.symbol,
+                "side": fill.side.value,
+                "qty": fill.qty,
+                "price": fill.price,
+                "fee": fill.fee,
+            },
+        })
+
+    # ------------------------------------------------------------------
+    # Orders — wired to ExecutionEngine → AlpacaBroker
+    # ------------------------------------------------------------------
 
     def place_order(self, req: PlaceOrderRequest) -> Dict[str, Any]:
-        order_id = uuid.uuid4().hex
-        order = {
-            "id": order_id,
-            "symbol": req.symbol,
-            "side": req.side,
-            "qty": float(req.qty),
-            "type": req.order_type,
-            "limit_price": req.limit_price,
-            "status": "submitted",
+        """Submit an order through the execution engine to Alpaca."""
+        broker = self._ensure_broker()
+        engine = self._engine
+        if engine is None:
+            raise RuntimeError("Execution engine not initialised")
+
+        side = Side.BUY if req.side == "buy" else Side.SELL
+        order_type = (
+            OrderType.LIMIT if req.order_type == "limit" else OrderType.MARKET
+        )
+
+        order = Order(
+            symbol=req.symbol.upper(),
+            side=side,
+            qty=float(req.qty),
+            order_type=order_type,
+            limit_price=float(req.limit_price) if req.limit_price else None,
+        )
+
+        positions = broker.get_positions()
+        result = engine.place_order(order, positions)
+
+        order_dict = {
+            "id": result.id,
+            "symbol": result.symbol,
+            "side": result.side.value,
+            "qty": result.qty,
+            "type": result.order_type.value,
+            "limit_price": result.limit_price,
+            "status": result.status.value,
+            "reason": result.reason,
             "ts": self.utcnow_iso(),
         }
-        self._orders.append(order)
-
-        # Simulate immediate fill for demo
-        fill_price = 100.0 if req.order_type == "market" else float(req.limit_price or 100.0)
-        order["status"] = "filled"
-        order["fill_price"] = fill_price
-
-        pos = self._positions.get(req.symbol, {"symbol": req.symbol, "qty": 0.0, "avg_price": 0.0})
-        signed_qty = req.qty if req.side == "buy" else -req.qty
-        new_qty = pos["qty"] + signed_qty
-
-        # naive avg price update (demo only)
-        if new_qty != 0 and req.side == "buy":
-            pos["avg_price"] = (pos["avg_price"] * pos["qty"] + fill_price * req.qty) / (pos["qty"] + req.qty)
-        pos["qty"] = new_qty
-        self._positions[req.symbol] = pos
 
         if self._event_sink:
-            self._event_sink({"type": "order_filled", "ts": self.utcnow_iso(), "data": order})
-            self._event_sink({"type": "position_update", "ts": self.utcnow_iso(), "data": pos})
+            self._event_sink({
+                "type": "order_submitted",
+                "ts": self.utcnow_iso(),
+                "data": order_dict,
+            })
 
-        return order
+        return order_dict
 
     def get_orders(self) -> List[Dict[str, Any]]:
-        return list(self._orders)
+        """Return open + recent orders from the execution engine."""
+        if self._engine is None:
+            return []
+
+        orders: List[Dict[str, Any]] = []
+        for oid, order in self._engine.open_orders.items():
+            orders.append({
+                "id": order.id,
+                "symbol": order.symbol,
+                "side": order.side.value,
+                "qty": order.qty,
+                "type": order.order_type.value,
+                "status": order.status.value,
+                "filled_qty": order.filled_qty,
+                "avg_fill_price": order.avg_fill_price,
+                "reason": order.reason,
+                "ts": datetime.fromtimestamp(
+                    order.created_ts, tz=timezone.utc,
+                ).isoformat(),
+            })
+
+        # Also include open orders from Alpaca directly
+        if self._broker is not None:
+            try:
+                alpaca_open = self._broker.get_open_orders()
+                seen_ids = {o["id"] for o in orders}
+                for ao in alpaca_open:
+                    if ao["alpaca_id"] not in seen_ids:
+                        orders.append({
+                            "id": ao["alpaca_id"],
+                            "symbol": ao["symbol"],
+                            "side": ao["side"],
+                            "qty": ao["qty"],
+                            "type": ao["type"],
+                            "status": ao["status"],
+                            "filled_qty": ao["filled_qty"],
+                            "avg_fill_price": None,
+                            "reason": None,
+                            "ts": ao["created_at"],
+                        })
+            except Exception as exc:
+                log.warning("Failed to fetch Alpaca open orders: %s", exc)
+
+        return orders
+
+    # ------------------------------------------------------------------
+    # Positions — wired to AlpacaBroker
+    # ------------------------------------------------------------------
 
     def get_positions(self) -> List[Dict[str, Any]]:
-        return list(self._positions.values())
+        """Return positions from Alpaca with live market prices."""
+        if self._broker is None:
+            return []
+
+        try:
+            raw = self._broker._trading.get_all_positions()
+        except Exception as exc:
+            log.warning("Failed to fetch positions: %s", exc)
+            return []
+
+        positions: List[Dict[str, Any]] = []
+        for pos in raw:
+            qty = float(pos.qty)
+            if str(pos.side) == "short":
+                qty = -qty
+            positions.append({
+                "symbol": str(pos.symbol),
+                "qty": qty,
+                "avg_price": float(pos.avg_entry_price),
+                "market_price": float(pos.current_price),
+                "market_value": float(pos.market_value),
+                "unrealized_pnl": float(pos.unrealized_pl),
+                "unrealized_pnl_pct": float(pos.unrealized_plpc) * 100,
+                "side": str(pos.side),
+            })
+
+        return positions
+
+    # ------------------------------------------------------------------
+    # Account — wired to AlpacaBroker
+    # ------------------------------------------------------------------
+
+    def get_account(self) -> Dict[str, Any]:
+        """Return the Alpaca account snapshot."""
+        if self._broker is None:
+            return {
+                "equity": None,
+                "cash": None,
+                "buying_power": None,
+                "portfolio_value": None,
+                "daily_pnl": None,
+            }
+        try:
+            acct = self._broker.get_account()
+            return {
+                "equity": acct["equity"],
+                "cash": acct["cash"],
+                "buying_power": acct["buying_power"],
+                "portfolio_value": acct["portfolio_value"],
+                "daily_pnl": None,
+            }
+        except Exception as exc:
+            log.warning("Failed to fetch account: %s", exc)
+            return {
+                "equity": None,
+                "cash": None,
+                "buying_power": None,
+                "portfolio_value": None,
+                "daily_pnl": None,
+            }
+
+    # ------------------------------------------------------------------
+    # Market clock — wired to AlpacaBroker
+    # ------------------------------------------------------------------
+
+    def get_clock(self) -> Dict[str, Any]:
+        """Return market clock info from Alpaca."""
+        if self._broker is None:
+            return {"is_open": False, "next_open": None, "next_close": None}
+        try:
+            return self._broker.get_clock()
+        except Exception as exc:
+            log.warning("Failed to fetch clock: %s", exc)
+            return {"is_open": False, "next_open": None, "next_close": None}
+
+    # ------------------------------------------------------------------
+    # Flatten all — wired to AlpacaBroker
+    # ------------------------------------------------------------------
+
+    def flatten_all(self) -> Dict[str, Any]:
+        """Cancel all orders and close all positions via Alpaca."""
+        if self._broker is None:
+            return {"cancelled": 0, "closed": 0}
+        cancelled = self._broker.cancel_all_orders()
+        closed = self._broker.close_all_positions()
+        if self._event_sink:
+            self._event_sink({
+                "type": "log",
+                "ts": self.utcnow_iso(),
+                "data": {
+                    "msg": f"Flattened: cancelled {cancelled} orders, "
+                           f"closed {closed} positions"
+                },
+            })
+        return {"cancelled": cancelled, "closed": closed}

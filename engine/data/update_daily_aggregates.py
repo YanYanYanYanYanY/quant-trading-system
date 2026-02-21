@@ -37,6 +37,9 @@ from pathlib import Path
 from typing import Optional
 
 import pandas as pd
+from dotenv import load_dotenv
+
+load_dotenv()  # reads .env from project root into os.environ
 
 from .polygon_agg_download import download_aggregates
 from .storage import RAW_DIR, file_exists, load_csv, load_parquet, save_csv, save_parquet
@@ -129,7 +132,7 @@ def download_and_update_ticker(
     api_key: str,
     data_dir: Path,
     start_date: str = FIRST_MARKET_DATE,
-    delay_seconds: float = 0.1,  # Rate limiting for API
+    delay_seconds: float = 13.0,
 ) -> tuple[bool, str]:
     """
     Download or update daily aggregates for a single ticker.
@@ -241,7 +244,7 @@ def update_all_daily_aggregates(
     api_key: Optional[str] = None,
     ticker_file: Optional[Path] = None,
     data_dir: Optional[Path] = None,
-    delay_seconds: float = 0.1,
+    delay_seconds: float = 13.0,
 ) -> dict[str, tuple[bool, str]]:
     """
     Update daily aggregates for all tickers in the ticker file.

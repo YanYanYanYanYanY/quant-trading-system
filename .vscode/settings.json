@@ -2,6 +2,6 @@
   "python.analysis.typeCheckingMode": "basic",
   "editor.formatOnSave": true,
   "python.formatting.provider": "black",
-  "files.autoSave": "onFocusChange",
+  "files.autoSave": "afterDelay",
   "python.terminal.activateEnvironment": true
 }

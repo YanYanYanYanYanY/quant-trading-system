@@ -26,7 +26,15 @@ build/
 # Node (if ui uses npm)
 node_modules/
 
-# Data / secrets (uncomment if you store local data here)
+# Data / secrets
 # data/
-# .env
-# *.key
+.env
+.env.local
+*.key
+
+# Raw stock data (downloaded via Polygon API — too large for git)
+engine/data/raw/stocks/*.csv
+engine/data/raw/stocks/*.parquet
+
+# Pytest cache
+.pytest_cache/

@@ -50,6 +50,7 @@ class PaperBroker(BrokerBase):
         self._orders: Dict[str, Order] = {}
         self._fills = deque()  # type: deque[Fill]
         self._delay_counter: Dict[str, int] = {}  # order_id -> polls waited
+        self._positions: Dict[str, float] = {}  # symbol -> signed qty
 
     # ---- market data ----
 
@@ -63,6 +64,9 @@ class PaperBroker(BrokerBase):
 
     def get_account(self) -> Dict:
         return {"cash": self.cash, "equity": self.equity, "buying_power": self.buying_power}
+
+    def get_positions(self) -> Dict[str, float]:
+        return dict(self._positions)
 
     # ---- order API ----
 
@@ -190,6 +194,13 @@ class PaperBroker(BrokerBase):
             order.status = OrderStatus.FILLED
         else:
             order.status = OrderStatus.PARTIALLY_FILLED
+
+        # Position bookkeeping
+        delta = fill_qty if order.side == Side.BUY else -fill_qty
+        self._positions[order.symbol] = self._positions.get(order.symbol, 0.0) + delta
+        # Remove flat positions
+        if abs(self._positions.get(order.symbol, 0.0)) < 1e-9:
+            self._positions.pop(order.symbol, None)
 
         self._fills.append(Fill(
             order_id=order.id,

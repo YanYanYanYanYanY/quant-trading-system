@@ -2,27 +2,50 @@ import { useAppStore } from "../../store";
 import { selectHealth } from "../../store/selectors/dashboard";
 import { useShallow } from "zustand/react/shallow";
 
+function Dot({ ok }: { ok: boolean | string }) {
+  const isOk = ok === true || ok === "true";
+  return (
+    <span
+      className={`badge-dot ${isOk ? "badge-dot-green" : "badge-dot-red"}`}
+    />
+  );
+}
+
 export function StatusStrip() {
   const health = useAppStore(useShallow(selectHealth));
 
   return (
     <div className="card">
       <div className="row" style={{ justifyContent: "space-between" }}>
-        <div className="h2">System Status</div>
-        <div className="muted" style={{ fontSize: 12 }}>
-          heartbeat age:{" "}
-          {health.hbAgeSeconds === null
-            ? "n/a"
-            : `${health.hbAgeSeconds.toFixed(1)}s`}
-        </div>
+        <div className="h2" style={{ margin: 0 }}>System Status</div>
+        <span className="badge" style={{ fontSize: 11 }}>
+          Heartbeat:{" "}
+          <b>
+            {health.hbAgeSeconds === null
+              ? "n/a"
+              : `${health.hbAgeSeconds.toFixed(1)}s`}
+          </b>
+        </span>
       </div>
 
-      <div className="row">
-        <span className="badge">API: <b>{String(health.apiUp)}</b></span>
-        <span className="badge">WS: <b>{String(health.ws)}</b></span>
-        <span className="badge">Broker: <b>{String(health.broker)}</b></span>
-        <span className="badge">Data: <b>{String(health.data)}</b></span>
-        <span className="badge">Stale: <b>{String(health.heartbeatStale)}</b></span>
+      <div className="row" style={{ marginTop: 10 }}>
+        <span className={`badge ${health.apiUp ? "badge-green" : "badge-red"}`}>
+          <Dot ok={health.apiUp} /> API
+        </span>
+        <span className={`badge ${health.ws ? "badge-green" : "badge-red"}`}>
+          <Dot ok={health.ws} /> WebSocket
+        </span>
+        <span className={`badge ${health.broker ? "badge-green" : "badge-amber"}`}>
+          <Dot ok={health.broker} /> Broker
+        </span>
+        <span className={`badge ${health.data ? "badge-green" : "badge-amber"}`}>
+          <Dot ok={health.data} /> Data
+        </span>
+        {health.heartbeatStale && (
+          <span className="badge badge-red">
+            <Dot ok={false} /> Stale
+          </span>
+        )}
       </div>
     </div>
   );
